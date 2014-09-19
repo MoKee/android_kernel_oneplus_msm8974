@@ -30,6 +30,7 @@
 #include "kgsl_cffdump.h"
 #include "kgsl_sharedmem.h"
 #include "kgsl_iommu.h"
+#include "kgsl_trace.h"
 
 #include "adreno.h"
 #include "adreno_pm4types.h"
@@ -80,16 +81,6 @@
 static void adreno_start_work(struct work_struct *work);
 static void adreno_input_work(struct work_struct *work);
 
-/*
- * The default values for the simpleondemand governor are 90 and 5,
- * we use different values here.
- * They have to be tuned and compare with the tz governor anyway.
- */
-static struct devfreq_simple_ondemand_data adreno_ondemand_data = {
-	.upthreshold = 80,
-	.downdifferential = 20,
-};
-
 static struct devfreq_msm_adreno_tz_data adreno_tz_data = {
 	.bus = {
 		.max = 350,
@@ -97,18 +88,12 @@ static struct devfreq_msm_adreno_tz_data adreno_tz_data = {
 	.device_id = KGSL_DEVICE_3D0,
 };
 
-static const struct devfreq_governor_data adreno_governors[] = {
-	{ .name = "simple_ondemand", .data = &adreno_ondemand_data },
-	{ .name = "msm-adreno-tz", .data = &adreno_tz_data },
-};
-
 static const struct kgsl_functable adreno_functable;
 
 static struct adreno_device device_3d0 = {
 	.dev = {
 		KGSL_DEVICE_COMMON_INIT(device_3d0.dev),
-		.pwrscale = KGSL_PWRSCALE_INIT(adreno_governors,
-					ARRAY_SIZE(adreno_governors)),
+		.pwrscale = KGSL_PWRSCALE_INIT(&adreno_tz_data),
 		.name = DEVICE_3D0_NAME,
 		.id = KGSL_DEVICE_3D0,
 		.mmu = {
@@ -263,15 +248,37 @@ static void adreno_input_event(struct input_handle *handle, unsigned int type,
 	struct kgsl_device *device = handle->handler->private;
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 
+	/* Only consider EV_ABS (touch) events */
+	if (type != EV_ABS)
+		return;
+
 	/*
-	 * Only queue the work under certain circumstances: we have to be in
-	 * slumber, the event has to be EV_EBS and we had to have processed an
-	 * IB since the last time we called wake on touch.
+	 * Don't do anything if anything hasn't been rendered since we've been
+	 * here before
 	 */
-	if ((type == EV_ABS) &&
-		!(device->flags & KGSL_FLAG_WAKE_ON_TOUCH) &&
-		(device->state == KGSL_STATE_SLUMBER))
+
+	if (device->flags & KGSL_FLAG_WAKE_ON_TOUCH)
+		return;
+
+	/*
+	 * If the device is in nap, kick the idle timer to make sure that we
+	 * don't go into slumber before the first render. If the device is
+	 * already in slumber schedule the wake.
+	 */
+
+	if (device->state == KGSL_STATE_NAP) {
+		/*
+		 * Set the wake on touch bit to keep from coming back here and
+		 * keeping the device in nap without rendering
+		 */
+
+		device->flags |= KGSL_FLAG_WAKE_ON_TOUCH;
+
+		mod_timer(&device->idle_timer,
+			jiffies + device->pwrctrl.interval_timeout);
+	} else if (device->state == KGSL_STATE_SLUMBER) {
 		schedule_work(&adreno_dev->input_work);
+	}
 }
 
 static int adreno_input_connect(struct input_handler *handler,
@@ -395,10 +402,14 @@ static int adreno_perfcounter_start(struct adreno_device *adreno_dev)
 					KGSL_PERFCOUNTER_BROKEN)
 				continue;
 
+			/*
+			 * The GPU has to be idle before calling the perfcounter
+			 * enable function, but since this function is called
+			 * during start we already know the GPU is idle
+			 */
 			if (adreno_dev->gpudev->perfcounter_enable)
-				ret = adreno_dev->gpudev->perfcounter_enable(
-					adreno_dev, i, j,
-					group->regs[j].countable);
+				ret = adreno_dev->gpudev->perfcounter_enable(adreno_dev, i,
+					j, group->regs[j].countable);
 				if (ret)
 					goto done;
 		}
@@ -706,6 +717,10 @@ int adreno_perfcounter_get(struct adreno_device *adreno_dev,
 	if (empty == -1)
 		return -EBUSY;
 
+	ret = adreno_idle(&adreno_dev->dev);
+	if (ret)
+		return ret;
+
 	/* enable the new counter */
 	ret = adreno_dev->gpudev->perfcounter_enable(adreno_dev, groupid, empty,
 		countable);
@@ -796,6 +811,11 @@ int adreno_perfcounter_put(struct adreno_device *adreno_dev,
  */
 static inline void adreno_perfcounter_restore(struct adreno_device *adreno_dev)
 {
+	/*
+	 * The GPU needs to be idle before writing the perfcounter select
+	 * registers. Since this function gets called during start/resume we
+	 * know the GPU is already idle so we don't need to stop it
+	 */
 	if (adreno_dev->gpudev->perfcounter_restore)
 		adreno_dev->gpudev->perfcounter_restore(adreno_dev);
 }
@@ -1829,13 +1849,11 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_ON);
 	device->ftbl->irqctrl(device, 1);
 
+	adreno_perfcounter_start(adreno_dev);
+
 	status = adreno_ringbuffer_cold_start(&adreno_dev->ringbuffer);
 	if (status)
 		goto error_irq_off;
-
-	status = adreno_perfcounter_start(adreno_dev);
-	if (status)
-		goto error_rb_stop;
 
 	/* Start the dispatcher */
 	adreno_dispatcher_start(device);
@@ -1846,8 +1864,6 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 
 	return 0;
 
-error_rb_stop:
-	adreno_ringbuffer_stop(&adreno_dev->ringbuffer);
 error_irq_off:
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_OFF);
 
@@ -2448,9 +2464,18 @@ static int adreno_set_constraint(struct kgsl_device *device,
 		context->pwr_constraint.type =
 				KGSL_CONSTRAINT_PWRLEVEL;
 		context->pwr_constraint.sub_type = pwr.level;
+		trace_kgsl_user_pwrlevel_constraint(device,
+			context->id,
+			context->pwr_constraint.type,
+			context->pwr_constraint.sub_type);
 		}
 		break;
 	case KGSL_CONSTRAINT_NONE:
+		if (context->pwr_constraint.type == KGSL_CONSTRAINT_PWRLEVEL)
+			trace_kgsl_user_pwrlevel_constraint(device,
+				context->id,
+				KGSL_CONSTRAINT_NONE,
+				context->pwr_constraint.sub_type);
 		context->pwr_constraint.type = KGSL_CONSTRAINT_NONE;
 		break;
 
@@ -2458,6 +2483,11 @@ static int adreno_set_constraint(struct kgsl_device *device,
 		status = -EINVAL;
 		break;
 	}
+
+	/* If a new constraint has been set for a context, cancel the old one */
+	if ((status == 0) &&
+		(context->id == device->pwrctrl.constraint.owner_id))
+		device->pwrctrl.constraint.type = KGSL_CONSTRAINT_NONE;
 
 	return status;
 }
@@ -2553,17 +2583,17 @@ bool adreno_hw_isidle(struct kgsl_device *device)
 	unsigned int reg_rbbm_status;
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 
+	adreno_readreg(adreno_dev, ADRENO_REG_RBBM_STATUS,
+		&reg_rbbm_status);
+
+	if (reg_rbbm_status & ~0x80000001)
+		return false;
+
 	/* Don't consider ourselves idle if there is an IRQ pending */
 	if (adreno_dev->gpudev->irq_pending(adreno_dev))
 		return false;
 
-	adreno_readreg(adreno_dev, ADRENO_REG_RBBM_STATUS,
-		&reg_rbbm_status);
-
-	if (!(reg_rbbm_status & 0x80000000))
-		return true;
-
-	return false;
+	return true;
 }
 
 /**
@@ -2679,6 +2709,7 @@ int adreno_idle(struct kgsl_device *device)
 {
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	unsigned long wait = jiffies + msecs_to_jiffies(ADRENO_IDLE_TIMEOUT);
+	int ret;
 
 	/*
 	 * Make sure the device mutex is held so the dispatcher can't send any
@@ -2695,6 +2726,17 @@ int adreno_idle(struct kgsl_device *device)
 		kgsl_cffdump_regpoll(device,
 			adreno_getreg(adreno_dev, ADRENO_REG_RBBM_STATUS) << 2,
 			0x110, 0x110);
+
+	/* Check if we are already idle before idling dispatcher */
+	if (adreno_isidle(device))
+		return 0;
+	/*
+	 * Wait for dispatcher to finish completing commands
+	 * already submitted
+	 */
+	ret = adreno_dispatcher_idle(adreno_dev);
+	if (ret)
+		return ret;
 
 	while (time_before(jiffies, wait)) {
 		/*
@@ -2864,7 +2906,7 @@ static void adreno_regwrite(struct kgsl_device *device,
 	if (!in_interrupt())
 		kgsl_pre_hwaccess(device);
 
-	kgsl_trace_regwrite(device, offsetwords, value);
+	trace_kgsl_regwrite(device, offsetwords, value);
 
 	kgsl_cffdump_regwrite(device, offsetwords << 2, value);
 	reg = (unsigned int *)(device->reg_virt + (offsetwords << 2));
