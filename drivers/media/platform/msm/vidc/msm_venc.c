@@ -723,7 +723,7 @@ static struct msm_vidc_ctrl msm_venc_ctrls[] = {
 	{
 		.id = V4L2_CID_MPEG_VIDC_VIDEO_USELTRFRAME,
 		.name = "H264 Use LTR",
-		.type = V4L2_CTRL_TYPE_BUTTON,
+		.type = V4L2_CTRL_TYPE_INTEGER,
 		.minimum = 0,
 		.maximum = (MAX_LTR_FRAME_COUNT - 1),
 		.default_value = 0,
@@ -753,7 +753,7 @@ static struct msm_vidc_ctrl msm_venc_ctrls[] = {
 	{
 		.id = V4L2_CID_MPEG_VIDC_VIDEO_MARKLTRFRAME,
 		.name = "H264 Mark LTR",
-		.type = V4L2_CTRL_TYPE_BUTTON,
+		.type = V4L2_CTRL_TYPE_INTEGER,
 		.minimum = 0,
 		.maximum = (MAX_LTR_FRAME_COUNT - 1),
 		.default_value = 0,
@@ -907,9 +907,23 @@ static int msm_venc_queue_setup(struct vb2_queue *q,
 	}
 	hdev = inst->core->device;
 
+	rc = msm_comm_try_state(inst, MSM_VIDC_OPEN_DONE);
+	if (rc) {
+		dprintk(VIDC_ERR, "Failed to open instance\n");
+		return rc;
+	}
+
+	rc = msm_comm_try_get_bufreqs(inst);
+	if (rc) {
+		dprintk(VIDC_ERR,
+				"Failed to get buffer requirements: %d\n", rc);
+		return rc;
+	}
+
 	switch (q->type) {
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		*num_planes = 1;
+
 		buff_req = get_buff_req_buffer(inst, HAL_BUFFER_OUTPUT);
 		if (buff_req) {
 			*num_buffers = buff_req->buffer_count_actual =
@@ -937,9 +951,18 @@ static int msm_venc_queue_setup(struct vb2_queue *q,
 		inst->fmts[CAPTURE_PORT]->num_planes = *num_planes;
 
 		for (i = 0; i < *num_planes; i++) {
+			int extra_idx = EXTRADATA_IDX(*num_planes);
+
 			sizes[i] = inst->fmts[CAPTURE_PORT]->get_frame_size(
 					i, inst->prop.height[CAPTURE_PORT],
 					inst->prop.width[CAPTURE_PORT]);
+
+			if (extra_idx && i == extra_idx &&
+					extra_idx < VIDEO_MAX_PLANES) {
+				buff_req = get_buff_req_buffer(inst,
+						HAL_BUFFER_EXTRADATA_OUTPUT);
+				sizes[i] = buff_req->buffer_size;
+			}
 		}
 
 		property_id = HAL_PARAM_BUFFER_COUNT_ACTUAL;
@@ -949,26 +972,18 @@ static int msm_venc_queue_setup(struct vb2_queue *q,
 			property_id, &new_buf_count);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
-		rc = msm_comm_try_state(inst, MSM_VIDC_OPEN_DONE);
-		if (rc) {
-			dprintk(VIDC_ERR, "Failed to open instance\n");
-			break;
-		}
-		rc = msm_comm_try_get_bufreqs(inst);
-		if (rc) {
-			dprintk(VIDC_ERR,
-				"Failed to get buffer requirements: %d\n", rc);
-			break;
-		}
 		*num_planes = 1;
+
 		mutex_lock(&inst->lock);
 		*num_buffers = inst->buff_req.buffer[0].buffer_count_actual =
 			max(*num_buffers, inst->buff_req.buffer[0].
 				buffer_count_actual);
 		mutex_unlock(&inst->lock);
+
 		property_id = HAL_PARAM_BUFFER_COUNT_ACTUAL;
 		new_buf_count.buffer_type = HAL_BUFFER_INPUT;
 		new_buf_count.buffer_count_actual = *num_buffers;
+
 		rc = call_hfi_op(hdev, session_set_property, inst->session,
 					property_id, &new_buf_count);
 		dprintk(VIDC_DBG, "size = %d, alignment = %d, count = %d\n",
@@ -980,6 +995,7 @@ static int msm_venc_queue_setup(struct vb2_queue *q,
 					i, inst->prop.height[OUTPUT_PORT],
 					inst->prop.width[OUTPUT_PORT]);
 		}
+
 		break;
 	default:
 		dprintk(VIDC_ERR, "Invalid q type = %d\n", q->type);
@@ -989,7 +1005,7 @@ static int msm_venc_queue_setup(struct vb2_queue *q,
 	return rc;
 }
 
-static int msm_venc_enable_hier_p(struct msm_vidc_inst *inst)
+static int msm_venc_toggle_hier_p(struct msm_vidc_inst *inst, bool enable)
 {
 	int num_enh_layers = 0;
 	u32 property_id = 0;
@@ -1004,9 +1020,10 @@ static int msm_venc_enable_hier_p(struct msm_vidc_inst *inst)
 	if (inst->fmts[CAPTURE_PORT]->fourcc != V4L2_PIX_FMT_VP8)
 		return 0;
 
-	num_enh_layers = inst->capability.hier_p.max - 1;
-	if (!num_enh_layers)
-		return 0;
+	num_enh_layers = enable ? inst->capability.hier_p.max - 1 : 0;
+
+	dprintk(VIDC_DBG, "%s Hier-P in firmware\n",
+			num_enh_layers ? "Enable" : "Disable");
 
 	hdev = inst->core->device;
 	property_id = HAL_PARAM_VENC_HIER_P_MAX_ENH_LAYERS;
@@ -1031,10 +1048,6 @@ static inline int start_streaming(struct msm_vidc_inst *inst)
 		dprintk(VIDC_ERR, "%s invalid parameters\n", __func__);
 		return -EINVAL;
 	}
-
-	rc = msm_venc_enable_hier_p(inst);
-	if (rc)
-		return rc;
 
 	if (inst->capability.pixelprocess_capabilities &
 		HAL_VIDEO_ENCODER_SCALING_CAPABILITY)
@@ -2163,7 +2176,7 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 	}
 	case V4L2_CID_MPEG_VIDC_VIDEO_USELTRFRAME:
 		property_id = HAL_CONFIG_VENC_USELTRFRAME;
-		useltr.refltr = ctrl->val;
+		useltr.refltr = (1 << ctrl->val);
 		useltr.useconstrnt = false;
 		useltr.frames = 0;
 		pdata = &useltr;
@@ -2176,6 +2189,9 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDC_VIDEO_HIER_P_NUM_LAYERS:
 		property_id = HAL_CONFIG_VENC_HIER_P_NUM_FRAMES;
 		hier_p_layers = ctrl->val;
+		rc = msm_venc_toggle_hier_p(inst, hier_p_layers ? true : false);
+		if (rc)
+			break;
 		if (hier_p_layers > (inst->capability.hier_p.max - 1)) {
 			dprintk(VIDC_ERR,
 				"Error setting hier p num layers = %d max supported by f/w = %d\n",
@@ -2228,6 +2244,12 @@ static int try_set_ext_ctrl(struct msm_vidc_inst *inst,
 	for (i = 0; i < ctrl->count; i++) {
 		switch (control[i].id) {
 		case V4L2_CID_MPEG_VIDC_VIDEO_LTRMODE:
+			if (control[i].value !=
+				V4L2_MPEG_VIDC_VIDEO_LTR_MODE_DISABLE) {
+				rc = msm_venc_toggle_hier_p(inst, false);
+				if (rc)
+					break;
+			}
 			ltrmode.ltrmode = control[i].value;
 			ltrmode.trustmode = 1;
 			property_id = HAL_PARAM_VENC_LTRMODE;
@@ -2286,7 +2308,6 @@ static int try_set_ext_ctrl(struct msm_vidc_inst *inst,
 		rc = call_hfi_op(hdev, session_set_property,
 				(void *)inst->session, property_id, pdata);
 	}
-	pr_err("Returning from %s\n", __func__);
 	return rc;
 }
 
@@ -3081,6 +3102,11 @@ int msm_venc_ctrl_init(struct msm_vidc_inst *inst)
 
 int msm_venc_ctrl_deinit(struct msm_vidc_inst *inst)
 {
+	if (!inst) {
+		dprintk(VIDC_ERR, "%s invalid parameters\n", __func__);
+		return -EINVAL;
+	}
+
 	kfree(inst->ctrls);
 	kfree(inst->cluster);
 	v4l2_ctrl_handler_free(&inst->ctrl_handler);

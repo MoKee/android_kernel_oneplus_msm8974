@@ -2525,13 +2525,6 @@ int msm_comm_qbuf(struct vb2_buffer *vb)
 			mutex_unlock(&inst->sync_lock);
 	} else {
 		int64_t time_usec = timeval_to_ns(&vb->v4l2_buf.timestamp);
-
-		rc = msm_vidc_check_session_supported(inst);
-		if (rc) {
-			dprintk(VIDC_ERR,
-				"%s: session not supported\n", __func__);
-			goto err_no_mem;
-		}
 		do_div(time_usec, NSEC_PER_USEC);
 		memset(&frame_data, 0 , sizeof(struct vidc_frame_data));
 		frame_data.alloc_len = vb->v4l2_planes[0].length;
@@ -3459,13 +3452,13 @@ int msm_vidc_check_session_supported(struct msm_vidc_inst *inst)
 				capability->height.min);
 			rc = -ENOTSUPP;
 		}
-
-		if (!rc) {
-			rc = call_hfi_op(hdev, capability_check,
-					inst->fmts[OUTPUT_PORT]->fourcc,
-					inst->prop.width[CAPTURE_PORT],
-					&capability->width.max,
-					&capability->height.max);
+		if (!rc && (inst->prop.width[CAPTURE_PORT] >
+			capability->width.max)) {
+			dprintk(VIDC_ERR,
+				"Unsupported width = %u supported max width = %u",
+				inst->prop.width[CAPTURE_PORT],
+				capability->width.max);
+				rc = -ENOTSUPP;
 		}
 		if (!rc && (inst->prop.height[CAPTURE_PORT]
 			* inst->prop.width[CAPTURE_PORT] >
