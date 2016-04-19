@@ -1049,7 +1049,8 @@ static void change_pageblock_range(struct page *pageblock_page,
  * as well.
  */
 static void try_to_steal_freepages(struct zone *zone, struct page *page,
-				  int start_type, int fallback_type)
+				   int start_type, int fallback_type,
+				   int start_order)
 {
 	int current_order = page_order(page);
 
@@ -1061,7 +1062,8 @@ static void try_to_steal_freepages(struct zone *zone, struct page *page,
 
 	if (current_order >= pageblock_order / 2 ||
 	    start_type == MIGRATE_RECLAIMABLE ||
-	    start_type == MIGRATE_UNMOVABLE ||
+	    // allow unmovable allocs up to 64K without migrating blocks
+	    (start_type == MIGRATE_UNMOVABLE && start_order >= 5) ||
 	    page_group_by_mobility_disabled) {
 		int pages;
 
@@ -1105,8 +1107,8 @@ __rmqueue_fallback(struct zone *zone, unsigned int order, int start_migratetype)
 
 			if (!is_migrate_cma(migratetype)) {
 				try_to_steal_freepages(zone, page,
-							start_migratetype,
-							migratetype);
+						       start_migratetype,
+						       migratetype, order);
 			} else {
 				/*
 				 * When borrowing from MIGRATE_CMA, we need to
@@ -4504,7 +4506,7 @@ static inline void setup_usemap(struct pglist_data *pgdat, struct zone *zone,
 #ifdef CONFIG_HUGETLB_PAGE_SIZE_VARIABLE
 
 /* Initialise the number of pages represented by NR_PAGEBLOCK_BITS */
-void __init set_pageblock_order(void)
+void __paginginit set_pageblock_order(void)
 {
 	unsigned int order;
 
@@ -4532,7 +4534,7 @@ void __init set_pageblock_order(void)
  * include/linux/pageblock-flags.h for the values of pageblock_order based on
  * the kernel config
  */
-void __init set_pageblock_order(void)
+void __paginginit set_pageblock_order(void)
 {
 }
 
